@@ -225,6 +225,53 @@ struct XeFlashPersistentTileScheduler {
   }
 };
 
+////////////////////////////////////////////////////////////////////////////////
+
+struct XePagedIndividualTileScheduler {
+
+  struct Params {
+    dim3 grid;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XePagedIndividualTileScheduler(Params const& params) : params(params) {}
+
+  template<class ProblemSize>
+  static Params to_underlying_arguments(
+      ProblemSize const& problem_size, KernelHardwareInfo hw_info) {
+    using namespace cute;
+    // problem_size = [num_heads_q, num_heads_kv, seq_len_qo, num_block, block_size, head_size]
+    dim3 grid(size(shape<2>(problem_size)), // seq_len_qo(bs)
+              size(1), // TODO: num_block * block_size / TileKV(512)
+              size(shape<1>(problem_size))); // num_heads_kv
+    return Params{ grid };
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    return make_coord(BlockIdxX(), BlockIdxY(), BlockIdxZ());
+  }
+
+  CUTLASS_DEVICE
+  XePagedIndividualTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 }  // namespace kernel
@@ -232,6 +279,7 @@ struct XeFlashPersistentTileScheduler {
   struct IndividualScheduler{};
   struct PersistentScheduler{};
   struct FlashDecodeIndividualScheduler{};
+  struct PagedIndividualScheduler{};
 
   namespace detail
   {
@@ -283,6 +331,15 @@ struct XeFlashPersistentTileScheduler {
         cute::enable_if_t<cute::is_same_v<ArchTag, cutlass::arch::IntelXe>>>
     {
       using Scheduler = kernel::XeFlashDecodeIndividualTileScheduler;
+    };
+
+    template <class ArchTag>
+    struct TileSchedulerSelector<
+        PagedIndividualScheduler,
+        ArchTag,
+        cute::enable_if_t<cute::is_same_v<ArchTag, cutlass::arch::IntelXe>>>
+    {
+      using Scheduler = kernel::XePagedIndividualTileScheduler;
     };
   } // namespace detail
 
