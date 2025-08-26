@@ -243,9 +243,9 @@ struct XePagedIndividualTileScheduler {
   static Params to_underlying_arguments(
       ProblemSize const& problem_size, KernelHardwareInfo hw_info) {
     using namespace cute;
-    // problem_size = [num_heads_q, num_heads_kv, seq_len_qo, num_block, block_size, head_size]
+    // problem_size = [num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size]
     dim3 grid(size(shape<2>(problem_size)), // seq_len_qo(bs)
-              size(1), // TODO: num_block * block_size / TileKV(512)
+              size(ceil_div(shape<3>(problem_size), 512)), // seq_len_kv / TileKV(512)
               size(shape<1>(problem_size))); // num_heads_kv
     return Params{ grid };
   }

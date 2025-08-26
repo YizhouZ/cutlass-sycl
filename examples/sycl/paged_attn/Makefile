@@ -1,7 +1,7 @@
 CXX = icpx
 # CXXFLAGS = -std=c++20 -O2 -fPIC -fsycl -fsycl-targets=spir64_gen
-CXXFLAGS = -O3 -DNDEBUG -std=c++17 -g -fPIE -fsycl -fsycl-targets=intel_gpu_pvc -ftemplate-backtrace-limit=0
-AOTFLAGS = --Xspirv-translator "-device pvc -options '-doubleGRF -vc-codegen -Xfinalizer -printregusage'"
+CXXFLAGS = -O3 -DNDEBUG -std=c++17 -fsycl -fsycl-targets=intel_gpu_pvc -ftemplate-backtrace-limit=0
+AOTFLAGS = --Xspirv-translator "-device pvc -internal_options -cl-intel-256-GRF-per-thread"
 CUTLASSFLAGS = -DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET -Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier -fno-sycl-instrument-device-code
 
 TORCH_DIR = /datadisk/wyz/miniforge-pypy3/envs/torch_val/lib/python3.10/site-packages/torch

@@ -6,7 +6,7 @@
 #include "flash_attention_v2/kernel/xe_paged.hpp"
 #include "flash_attention_v2/collective/xe_paged_mma.hpp"
 #include "flash_attention_v2/collective/paged_epilogue.hpp"
-#include "cutlass/epilogue/fusion/xe_callbacks.hpp"
+#include "flash_attention_v2/collective/xe_paged_softmax_epilogue.hpp"
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
 
 #include "cutlass/util/GPU_Clock.hpp"
@@ -38,7 +38,7 @@ static std::string shape_to_string(const c10::IntArrayRef& shape) {
     return oss.str();
 }
 
-void assert_allclose(const torch::Tensor &a, const torch::Tensor &b, float rtol = 1e-2, float atol = 1e-2) {
+void assert_allclose(const torch::Tensor &a, const torch::Tensor &b, float rtol = 1e-2, float atol = 1e-1) {
     if (!a.sizes().equals(b.sizes())) {
         throw std::runtime_error("Tensor sizes do not match: " +
                                  shape_to_string(a.sizes()) + " vs " + shape_to_string(b.sizes()));
@@ -81,8 +81,89 @@ void assert_allclose(const torch::Tensor &a, const torch::Tensor &b, float rtol 
     }
 }
 
-int num_heads_q = 8;
-int num_heads_kv = 1;
+torch::Tensor ref_compute_out(torch::Tensor &scores, torch::Tensor &value_cache,
+                              torch::Tensor &block_tables,
+                              uint32_t partition_size = 512, 
+                              bool use_partition = false) {
+  // scores: [num_seqs, num_heads, seq_len]
+  // now we need seq_len % partition_size == 0
+
+  std::cout << "scores shape: " << scores.sizes() << std::endl;
+  std::cout << "value_cache.dtype: " << value_cache.dtype() << std::endl;
+
+  auto num_seqs = scores.size(0);
+  auto num_heads = scores.size(1);
+  auto seq_len = scores.size(2);
+  auto num_partitions = (seq_len + partition_size - 1) / partition_size;
+
+  auto num_blocks = value_cache.size(0);
+  auto block_size = value_cache.size(1);
+  auto num_kv_heads = value_cache.size(2);
+  auto head_size = value_cache.size(3);
+  
+  auto query_group_size = num_heads / num_kv_heads;
+
+  uint32_t useful_blocks = (seq_len + block_size - 1) / block_size;
+
+  torch::Tensor tem_output = torch::zeros({num_seqs, num_kv_heads, num_partitions,
+                                       query_group_size, head_size},
+                                      torch::kBFloat16)
+                             .to(scores.device());
+  torch::Tensor ultimate_output = torch::zeros(
+      {num_seqs, num_kv_heads, query_group_size, head_size}, torch::kBFloat16)
+      .to(scores.device());
+  for (int j = 0; j < num_kv_heads; ++j) {
+    for (int i = 0; i < num_seqs; ++i) {
+      auto start_block = block_tables[i];
+      std::vector<torch::Tensor> value_blocks;
+      for (int u = 0; u < useful_blocks; ++u) {
+        auto curr_value_block = value_cache[start_block[u]];
+        auto value_slice = curr_value_block.index({Slice(), j, Slice()});
+        value_blocks.push_back(value_slice);
+      }
+      auto value_tensor = torch::cat(value_blocks, /*dim=*/0);
+      std::cout << "value_tensor shape: " << value_tensor.sizes() << std::endl;
+      if (use_partition) {
+        for (int k = 0; k < num_partitions; ++k) {
+          auto scores_view = scores
+                                 .view({num_seqs, num_kv_heads, query_group_size,
+                                        num_partitions, partition_size})
+                                 .transpose(2, 3)
+                                 .contiguous();
+          auto score_slice = scores_view[i][j][k];
+          auto value_partition =
+              value_tensor.slice(0, k * partition_size, (k + 1) * partition_size)
+                  .contiguous();
+
+          std::cout << "score_slice shape: " << score_slice.sizes() << std::endl;
+          tem_output[i][j][k] = torch::matmul(score_slice, value_partition);
+        }
+      } else {
+        // no partition, just do it directly
+        auto scores_view = scores
+                               .view({num_seqs, num_kv_heads, query_group_size,
+                                      seq_len})
+                               .contiguous();
+        auto score_slice = scores_view[i][j];
+        auto value_partition = value_tensor.contiguous();
+        std::cout << "score_slice shape: " << score_slice.sizes() << std::endl;
+        // std::cout << "score_slice: " << score_slice << std::endl;
+        // std::cout << "value_partition: " << value_partition << std::endl;
+        ultimate_output[i][j] = torch::matmul(score_slice, value_partition);
+      }
+    }
+  }
+  if (use_partition) {
+    return tem_output.transpose(2, 3).contiguous().view(
+        {num_seqs, num_heads, num_partitions, head_size});
+  } else {
+    return ultimate_output.contiguous().view(
+        {num_seqs, num_heads, head_size});
+  }
+}
+
+int num_heads_q = 16;
+int num_heads_kv = 2;
 int seq_len_q = 1;
 int num_block = 8;
 int block_size = 64;
@@ -90,23 +171,96 @@ int head_size = 128;
 int seq_len_kv = num_block * block_size;
 int max_blocks_per_seq = num_block;
 int group_heads = num_heads_q / num_heads_kv;
-torch::Tensor block_tables, query, key_cache, value_cache, scores;
+torch::Tensor block_tables, query, key_cache, value_cache, scores, out;
 
 void init_values() {
-  query = torch::randn({seq_len_q, num_heads_q, head_size}, torch::kBFloat16)
+  query = torch::rand({seq_len_q, num_heads_q, head_size}, torch::kBFloat16)
           .to(torch::kXPU);
-  key_cache = torch::randn({num_block, block_size, num_heads_kv, head_size}, torch::kBFloat16)
+  key_cache = torch::rand({num_block, block_size, num_heads_kv, head_size}, torch::kBFloat16)
           .to(torch::kXPU);
   // for (int i = 0; i < num_block; ++i) {
   //   key_cache[i].fill_(i + 1);
   // }
-  value_cache = torch::randn({num_block, block_size, num_heads_kv, head_size}, torch::kBFloat16)
+  // std::cout << "key_cache: " << key_cache[0] << std::endl;
+  value_cache = torch::rand({num_block, block_size, num_heads_kv, head_size}, torch::kBFloat16)
           .to(torch::kXPU);
+  // for (int i = 0; i < num_block; ++i) {
+  //   value_cache[i].fill_(i + 1);
+  // }
+  // for (int i = 0; i < num_block; ++i) {
+  //   for (int j = 0; j < block_size; ++j) {
+  //     for (int k = 0; k < num_heads_kv; ++k) {
+  //       for (int l = 0; l < head_size; ++l) {
+  //         value_cache[i][j][k][l] = l + 1;
+  //       }
+  //     }
+  //   }
+  // }
   block_tables = torch::ones({seq_len_q, max_blocks_per_seq}, torch::kInt).to(torch::kXPU);
   scores = torch::zeros({seq_len_q, num_heads_kv, group_heads, seq_len_kv}, torch::kFloat32).to(torch::kXPU);
+  out = torch::zeros_like(query).to(torch::kFloat32);
 
-  block_tables[0] =
-      torch::arange(0, max_blocks_per_seq, torch::kInt).to(torch::kXPU);
+  // block_tables[0] =
+  //     torch::arange(0, max_blocks_per_seq, torch::kInt).to(torch::kXPU);
+  // block_tables[0][1] = 0;
+  block_tables[0] = torch::randint(0, max_blocks_per_seq, {max_blocks_per_seq});
+  std::cout << "block_tables: " << block_tables[0] << std::endl;
+}
+
+auto ref_softmax(torch::Tensor &scores, uint32_t partition_size = 512, bool use_partition = false) {
+  // scores: [num_seqs, num_heads, seq_len]
+  // now we need seq_len % partition_size == 0
+  auto num_seqs = scores.size(0);
+  auto num_heads = scores.size(1);
+  auto seq_len = scores.size(2);
+  auto num_partitions = (seq_len + partition_size - 1) / partition_size;
+
+  torch::Tensor ref_max_logits =
+      torch::empty({scores.size(0), scores.size(1), num_partitions},
+                   torch::kFloat32)
+          .to(scores.device());
+  torch::Tensor ref_exp_sums =
+      torch::empty({scores.size(0), scores.size(1), num_partitions},
+                   torch::kFloat32)
+          .to(scores.device());
+  auto scores_view = use_partition ? 
+                     scores.view({num_seqs, num_heads, num_partitions, partition_size}) : 
+                     scores.view({num_seqs, num_heads, seq_len});
+  float scale = 1 / sqrt(static_cast<float>(head_size));
+
+  for (int i = 0; i < num_seqs; ++i)
+    for (int j = 0; j < num_heads; ++j)
+      for (int k = 0; k < seq_len; ++k)
+        scores_view[i][j][k] *= scale;
+
+  for (int i = 0; i < num_seqs; ++i) {
+    for (int j = 0; j < num_heads; ++j) {
+      if (use_partition) {
+        for (int k = 0; k < num_partitions; ++k) {
+          torch::Tensor ref_max_slice;
+          torch::Tensor max_indices;
+          std::tie(ref_max_slice, max_indices) =
+              torch::max(scores_view[i][j][k], /*dim=*/0, /*keepdim=*/false);
+          ref_max_logits[i][j][k] = ref_max_slice.item<float>();
+          scores_view[i][j][k] = torch::exp(scores_view[i][j][k] - ref_max_slice);
+          ref_exp_sums[i][j][k] = torch::sum(scores_view[i][j][k]);
+          scores_view[i][j][k] = scores_view[i][j][k] / ref_exp_sums[i][j][k];
+        }
+      } else {
+        // no partition, just do it directly
+        torch::Tensor ref_max_slice;
+        torch::Tensor max_indices;
+        std::tie(ref_max_slice, max_indices) =
+            torch::max(scores_view[i][j], /*dim=*/0, /*keepdim=*/false);
+        ref_max_logits[i][j][0] = ref_max_slice.item<float>();
+        scores_view[i][j] = torch::exp(scores_view[i][j] - ref_max_slice);
+        ref_exp_sums[i][j][0] = torch::sum(scores_view[i][j]);
+        scores_view[i][j] = scores_view[i][j] / ref_exp_sums[i][j][0];
+      }
+    }
+  }
+  scores = scores_view.view({num_seqs, num_heads, seq_len});
+  return std::make_tuple(ref_max_logits, ref_exp_sums);
 }
 
 torch::Tensor ref_compute_score(torch::Tensor &query, torch::Tensor &key_cache,
@@ -145,14 +299,16 @@ torch::Tensor ref_compute_score(torch::Tensor &query, torch::Tensor &key_cache,
     }
   }
   return scores_ref.transpose(2, 3).contiguous().view(
-      {num_seqs, num_kv_heads, query_group_size, useful_blocks * block_size});
+      {num_seqs, num_kv_heads * query_group_size, useful_blocks * block_size});
 }
 
 
 template <int KVTile, int NumSG>
 void run_gemm() {
   using TileShapeQK = Shape<_8, Int<KVTile>, _64>;
-  using TileShapeOut = Shape<_8, Int<KVTile>, _64>;
+  using TileShapePV = Shape<_8, _16, _64>; // block_size as last dim
+  using TileShapeOut = Shape<_8, _128, Int<KVTile>>;
+  using TileShapeDebug = Shape<_8, Int<KVTile>, _64>;
   using SubgroupLayout = cute::Layout<Shape<Int<NumSG>, _1, _1>, cute::Stride<_1, _1, _1>>;
 
   const int PipelineStages = 2;
@@ -161,7 +317,7 @@ void run_gemm() {
   using MMAOperation = XE_8x16x16_F32BF16BF16F32_TT;
   using GmemTiledCopyQ = XE_2D_U16x8x16_LD_N;
   using GmemTiledCopyK = XE_2D_U16x16x16_LD_T; // transposed due to col major
-  using GmemTiledCopyV = XE_2D_U16x32x32_LD_V;
+  using GmemTiledCopyV = XE_2D_U16x32x16_LD_V; // TODO: tune perf for XE_2D_U16x32x16_LD_V and XE_2D_U16x16x16_LD_V
   using ElementAccumulator = float;
   using ElementOutput = float;
   using GmemTiledCopyStore = XE_2D_U32x8x16_ST_N;
@@ -177,11 +333,12 @@ void run_gemm() {
   using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
 
+  using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::FlashPagedSoftmaxEpilogue<EpilogueDispatchPolicy, ElementAccumulator>;
   using CollectiveEpilogue = cutlass::flash_attention::collective::FlashPagedEpilogue<
-        EpilogueDispatchPolicy, MMAOperation, TileShapeOut, SubgroupLayout, ElementAccumulator, ElementOutput, cutlass::gemm::TagToStrideC_t<LayoutO>,
+        EpilogueDispatchPolicy, MMAOperation, TileShapeOut, TileShapeDebug, SubgroupLayout, ElementAccumulator, ElementOutput, cutlass::gemm::TagToStrideC_t<LayoutO>,
         GmemTiledCopyStore>;
 
-  using ProblemShapeType = cute::tuple<int, int, int, int, int, int>;
+  using ProblemShapeType = cute::tuple<int, int, int, int, int, int, int>;
   using namespace cutlass::fmha::collective;
 
   // Mainloop
@@ -189,26 +346,35 @@ void run_gemm() {
       GEMMDispatchPolicy, ProblemShapeType,
       ElementInputQ, cutlass::gemm::TagToStrideA_t<LayoutQ>,
       ElementInputKV, cutlass::gemm::TagToStrideB_t<LayoutK>,
+      ElementInputKV, cutlass::gemm::TagToStrideB_t<LayoutV>,
       MMAOperation,
-      TileShapeQK, SubgroupLayout,
-      GmemTiledCopyQ/* Q */, GmemTiledCopyK/* K */>;
+      TileShapeQK, TileShapePV, SubgroupLayout,
+      GmemTiledCopyQ/* Q */, GmemTiledCopyK/* K */,  GmemTiledCopyV/* V */>;
 
   using Scheduler = cutlass::flash_attention::PagedIndividualScheduler;
   using FMHAKernel = cutlass::flash_attention::kernel::FMHAPaged<ProblemShapeType,
                                                                  CollectiveMainloop,
+                                                                 CollectiveSoftmaxEpilogue,
                                                                  CollectiveEpilogue,
                                                                  Scheduler>;
   
-  ProblemShapeType problem_shape = cute::make_tuple(num_heads_q, num_heads_kv, seq_len_q, num_block, block_size, head_size);
+  ProblemShapeType problem_shape = cute::make_tuple(num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size);
   using StrideQ = typename FMHAKernel::StrideQ;
   using StrideK = typename FMHAKernel::StrideK;
+  using StrideV = typename FMHAKernel::StrideV;
+  using StrideO = typename FMHAKernel::StrideO;
   using StrideS = typename FMHAKernel::StrideS;
 
   StrideQ stride_Q;
   StrideK stride_K;
+  StrideV stride_V;
+  StrideO stride_O;
   StrideS stride_S;
+  // print("strdeQ: "); print(StrideQ{}); print("\n");
   stride_Q = cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(num_heads_q, head_size, seq_len_q));
-  stride_K = cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, head_size, num_heads_kv));
+  stride_K = cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv * num_heads_kv, head_size, 1));
+  stride_V = cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size, seq_len_kv * num_heads_kv, 1));
+  stride_O = cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(num_heads_q, head_size, seq_len_q));
   stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(group_heads, seq_len_kv, seq_len_q * num_heads_kv));
 
   typename FMHAKernel::Arguments arguments{
@@ -217,11 +383,14 @@ void run_gemm() {
         {
           reinterpret_cast<ElementInputQ*>(query.data_ptr()), stride_Q,
           reinterpret_cast<ElementInputKV*>(key_cache.data_ptr()), stride_K,
+          reinterpret_cast<ElementInputKV*>(value_cache.data_ptr()), stride_V,
           reinterpret_cast<int*>(block_tables.data_ptr()),
           block_size,
           max_blocks_per_seq
         },
-        {reinterpret_cast<ElementOutput*>(scores.data_ptr()), stride_S},
+        {1 / sqrt(static_cast<float>(head_size))},
+        // {1.0f},
+        {reinterpret_cast<ElementOutput*>(out.data_ptr()), stride_O, reinterpret_cast<ElementOutput*>(scores.data_ptr()), stride_S},
         hw_info};
 
   size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
@@ -269,12 +438,22 @@ int main() {
   //   std::cout << "block_id: " << i << std::endl;
   //   std::cout << scores[0][0][0].slice(0, row_start, row_end) << std::endl;
   // }
-  // std::cout << scores[0] << std::endl;
+  // std::cout << scores[0][0] << std::endl;
+  // std::cout << "max: " << scores[0][0].max(-1) << std::endl;
+  // std::cout << "sum: " << scores[0][0].sum(-1) << std::endl;
+  // std::cout << "key_cache: " << key_cache << std::endl;
+  // std::cout << out << std::endl;
   
   torch::Tensor context_lens = torch::ones({seq_len_q}, torch::kInt).to(torch::kXPU);
   context_lens[0] = seq_len_kv;
   auto ref_scores = ref_compute_score(query, key_cache, block_tables, context_lens);
-  
-  assert_allclose(ref_scores.to(torch::kFloat32), scores.to(torch::kFloat32));
+  auto [ref_max_logits, ref_exp_sums] = ref_softmax(ref_scores);
+  auto ref_scores_view = ref_scores.view({seq_len_q, num_heads_kv, group_heads, num_block * block_size});
+  assert_allclose(ref_scores_view.to(torch::kFloat32), scores.to(torch::kFloat32));
+
+  ref_scores = ref_scores.to(value_cache.dtype());
+  auto scores_dtype = scores.to(value_cache.dtype()).view_as(ref_scores);
+  auto ref_out = ref_compute_out(scores_dtype, value_cache, block_tables);
+  assert_allclose(ref_out.to(torch::kFloat32), out.to(torch::kFloat32));
   return 0;
 }

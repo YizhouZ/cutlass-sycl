@@ -47,16 +47,17 @@ namespace cutlass {
 namespace flash_attention {
 namespace collective {
 
-template <class DispatchPolicy, class MMAOperation_, class TileShapeOutput_, class SubgroupLayout_, class... Args> class FlashPagedEpilogue {
+template <class DispatchPolicy, class MMAOperation_, class TileShapeOutput_, class TileShapeDebug_, class SubgroupLayout_, class... Args> class FlashPagedEpilogue {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy>, "Could not find an epilogue specialization.");
 };
 
-template <class MMAOperation_, class TileShapeOutput_, class SubgroupLayout_,
+template <class MMAOperation_, class TileShapeOutput_, class TileShapeDebug_, class SubgroupLayout_,
           class ElementCompute_, class ElementO_, class StrideO_,
           // class ElementLSE_,
           class CopyOpO_>
 class FlashPagedEpilogue<epilogue::IntelXeXMX16,
-                          MMAOperation_, TileShapeOutput_, SubgroupLayout_,
+                          MMAOperation_, TileShapeOutput_, TileShapeDebug_,
+                          SubgroupLayout_,
                           ElementCompute_, ElementO_, StrideO_,
                           //ElementLSE_,
                           CopyOpO_> {
@@ -68,6 +69,7 @@ public:
   using CopyOpO = CopyOpO_;
   using SubgroupLayout = SubgroupLayout_;
   using TileShapeOutput = TileShapeOutput_;
+  using TileShapeDebug = TileShapeDebug_;
   using TiledMmaOutput = typename TiledMMAHelper<MMA_Atom<MMAOperation_>, Layout<TileShapeOutput>, SubgroupLayout>::TiledMMA;
   using GmemTiledCopyO = CopyOpO;
   using ElementOutput = ElementO_;
@@ -78,6 +80,7 @@ public:
   static constexpr int SubgroupSize = DispatchPolicy::SubgroupSize;
 
   using SubgroupTileShape = decltype(make_shape(get<0>(TileShapeOutput{}), Int<get<1>(TileShapeOutput{}) / ATOM_M>{}, get<2>(TileShapeOutput{})));
+  using SubgroupTileShapeDebug = decltype(make_shape(get<0>(TileShapeDebug{}), Int<get<1>(TileShapeDebug{}) / ATOM_M>{}, get<2>(TileShapeDebug{})));
   // using SubgroupTileShape = decltype(cute::shape_div(TileShapeOutput{}, (SubgroupLayout{}.shape())));
 
   static_assert(cute::rank(TileShapeOutput{}) == 3, "TileShapeOutput must be rank-3: [CTA_M_QO, CTA_N_VO, CTA_K_PV]");
@@ -109,11 +112,14 @@ public:
   struct Arguments {
     ElementO const *ptr_O;
     StrideO dO;
+    ElementO const *ptr_S;
+    StrideO dS;
   };
 
   // Device side epilogue params
   struct Params {
     XE_Copy_O xe_store_o;
+    XE_Copy_O xe_store_s;
   };
 
   //
@@ -123,16 +129,19 @@ public:
   template <class ProblemShape>
   static constexpr Params to_underlying_arguments(ProblemShape const &problem_shape, Arguments const &args,
                                                   [[maybe_unused]] void *workspace) {
-    auto [num_heads_q, num_heads_kv, seq_len_qo, num_block, block_size, head_size] = problem_shape;
-    auto seq_len_kv = block_size * num_block;
+    auto [num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size] = problem_shape;
     auto group_heads = ceil_div(num_heads_q, num_heads_kv);
 
     auto tensorO = make_tensor(make_gmem_ptr(static_cast<ElementO const*>(args.ptr_O)), 
-                                             make_layout(make_shape(group_heads, seq_len_kv, seq_len_qo * num_heads_kv),
+                                             make_layout(make_shape(num_heads_q, head_size, seq_len_qo),
                                              args.dO));
+    auto tensorS = make_tensor(make_gmem_ptr(static_cast<ElementO const*>(args.ptr_S)), 
+                                             make_layout(make_shape(group_heads, seq_len_kv, seq_len_qo * num_heads_kv),
+                                             args.dS));
     XE_Copy_O xe_store_o{XE_Copy_O{}.with(tensorO)};
+    XE_Copy_O xe_store_s{XE_Copy_O{}.with(tensorS)};
     return {
-        xe_store_o,
+        xe_store_o, xe_store_s
     };
   }
 
@@ -157,7 +166,51 @@ public:
   FlashPagedEpilogue(Params const &params_, TensorStorage const &) : params(params_) {}
 
   template <class ProblemShape, class TileCoord, class FragOut>
+  CUTLASS_DEVICE void store_O(ProblemShape problem_shape, TileCoord tile_coord, FragOut &out) {
+
+    using namespace cute;
+    using FragOutLayout = typename FragOut::layout_type;
+    constexpr int Vec    = shape<0>(FragOutLayout{});
+    constexpr int FragsM = shape<1>(FragOutLayout{});
+    constexpr int FragsN = shape<2>(FragOutLayout{});
+
+    auto out_reg = make_tensor(static_cast<decltype(out) &&>(out).data() , Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
+
+    // tile the output ptr
+    auto [m_coord, n_coord, l_coord] = tile_coord;
+    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size] = problem_shape;
+    // tile for wg
+    Tensor mO_mnl = cute::get_xe_tensor(make_shape(num_heads_q, head_size, seq_len_q));
+    Tensor mO_mn = mO_mnl(_, _, l_coord);
+    Tensor g_wg_O = local_tile(mO_mn, select<0, 1>(TileShapeOutput{}), make_coord(m_coord, n_coord));
+    // tile for sg
+    const int m_sg = 0;
+    const int n_sg = get_sub_group_id();
+    // Tile the output tensor per SG
+    Tensor gO = local_tile(g_wg_O, SubgroupTileShape{}, make_coord(m_sg, n_sg, _), Step<_1,_1, X>{});
+    
+    auto thread_xe_store_o = params.xe_store_o.get_thread_slice(ThreadIdxX());
+    Tensor tOgO = thread_xe_store_o.partition_D(gO);
+
+    copy(params.xe_store_o, out_reg, tOgO);
+// #define PRINT(x) print(#x ": "); print(x); print("\n");
+//   if (cute::thread(0, 0)) {
+//     print("======================= S: \n");
+//     // PRINT(out_reg);
+//     PRINT(mO_mn);
+//     PRINT(g_wg_O);
+//     PRINT(gO);
+//     PRINT(tOgO);
+//     PRINT(thread_xe_store_o);
+//     PRINT(l_coord);
+//     print_tensor(out_reg);
+//   }
+// #undef PRINT
+  }
+
+  template <class ProblemShape, class TileCoord, class FragOut>
   CUTLASS_DEVICE void debug_store_S(ProblemShape problem_shape, TileCoord tile_coord, FragOut &score) {
+
     using namespace cute;
     using FragOutLayout = typename FragOut::layout_type;
     constexpr int Vec    = shape<0>(FragOutLayout{});
@@ -168,34 +221,28 @@ public:
 
     // tile the output ptr
     auto [m_coord, n_coord, k_coord, l_coord] = tile_coord;
-    auto& num_heads_q = get<0>(problem_shape);
-    auto& num_heads_kv = get<1>(problem_shape);
-    auto& seq_len_q = get<2>(problem_shape);
-    auto& num_block = get<3>(problem_shape);
-    auto& block_size = get<4>(problem_shape);
-    auto& head_size = get<5>(problem_shape);
+    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size] = problem_shape;
     auto group_heads = ceil_div(num_heads_q, num_heads_kv); // 8
-    auto seq_len_kv = num_block * block_size;
     // tile for wg
     Tensor mS_mnl = cute::get_xe_tensor(make_shape(group_heads, seq_len_kv, seq_len_q * num_heads_kv));
     Tensor mS_mn = mS_mnl(_, _, l_coord);
-    Tensor g_wg_S = local_tile(mS_mn, select<0, 1>(TileShapeOutput{}), make_coord(m_coord, n_coord));
+    Tensor g_wg_S = local_tile(mS_mn, select<0, 1>(TileShapeDebug{}), make_coord(m_coord, n_coord));
     // tile for sg
-    static constexpr auto ATOM_N = get<2>(typename TiledMmaOutput::ThrLayoutVMNK{}.shape());
     const int m_sg = 0;
     const int n_sg = get_sub_group_id();
     // Tile the output tensor per SG
-    Tensor gS = local_tile(g_wg_S, SubgroupTileShape{}, make_coord(m_sg, n_sg, _), Step<_1,_1, X>{});
+    Tensor gS = local_tile(g_wg_S, SubgroupTileShapeDebug{}, make_coord(m_sg, n_sg, _), Step<_1,_1, X>{});
     // if(cute::thread(16, 0)) {
     //   print("n_sg: "); print(n_sg); print("\n");
     // }
     
-    auto thread_xe_store_o = params.xe_store_o.get_thread_slice(ThreadIdxX());
-    Tensor tSgS = thread_xe_store_o.partition_D(gS);
+    auto thread_xe_store_s = params.xe_store_s.get_thread_slice(ThreadIdxX());
+    Tensor tSgS = thread_xe_store_s.partition_D(gS);
     
-    copy(params.xe_store_o, out_reg, tSgS);
+    copy(params.xe_store_s, out_reg, tSgS);
+    // copy(xe_store_smem, out_reg, tSgS);
 // #define PRINT(x) print(#x ": "); print(x); print("\n");
-//   if (cute::thread(16, 0)) {
+//   if (cute::thread(0, 1)) {
 //     print("======================= S: \n");
 //     PRINT(out_reg);
 //     PRINT(mS_mn);
@@ -203,6 +250,7 @@ public:
 //     PRINT(gS);
 //     PRINT(tSgS);
 //     PRINT(thread_xe_store_o);
+//     PRINT(l_coord);
 //   }
 // #undef PRINT
   }
