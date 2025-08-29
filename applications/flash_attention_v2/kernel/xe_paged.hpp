@@ -59,7 +59,7 @@ class FMHAPaged {
 public:
   using ProblemShape = ProblemShape_;
   
-  static_assert(rank(ProblemShape{}) == 7, "ProblemShape{} should be <num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size>");
+  static_assert(rank(ProblemShape{}) == 9, "ProblemShape{} should be <num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads>");
 
   // For Mainloop Gemm
   using CollectiveMainloop = CollectiveMainloop_;
@@ -82,6 +82,7 @@ public:
   using CollectiveSoftmaxEpilogue = CollectiveSoftmaxEpilogue_;
   using SoftmaxArguments = typename CollectiveSoftmaxEpilogue::Arguments;
   using SoftmaxParams = typename CollectiveSoftmaxEpilogue::Params;
+  using StrideE = typename CollectiveSoftmaxEpilogue::Stride;
 
   static_assert(cute::is_void_v<TileScheduler_> or cute::is_same_v<TileScheduler_, PagedIndividualScheduler>,
                 "Unsupported TileScheduler for Intel PVC.");
@@ -97,7 +98,6 @@ public:
 
   using ElementO = typename CollectiveEpilogue::ElementO;
   using StrideO = typename CollectiveEpilogue::StrideO;
-  // using ElementLSE = typename CollectiveEpilogue::ElementLSE;
   using EpilogueArguments = typename CollectiveEpilogue::Arguments;
   using EpilogueParams = typename CollectiveEpilogue::Params;
   using TiledMmaOutput = typename CollectiveEpilogue::TiledMmaOutput;
@@ -177,18 +177,9 @@ public:
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static Params to_underlying_arguments(Arguments const &args, void *workspace) {
     (void)workspace;
-    // auto& num_heads_q = get<0>(params.problem_shape);
-    // auto& num_heads_kv = get<1>(params.problem_shape);
-    // auto& seq_len_q = get<2>(params.problem_shape);
-    // auto& num_block = get<3>(params.problem_shape);
-    // auto& block_size = get<4>(params.problem_shape);
-    // auto& head_size = get<5>(params.problem_shape);
-    // auto group_heads = num_heads_q / num_heads_kv; // 8
-    // auto seq_len_kv = num_block * block_size;
-    // {num_heads_q, seq_len_kv, head_size, seq_len_q}
     return {args.mode, args.problem_shape,
             CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
-            CollectiveSoftmaxEpilogue::to_underlying_arguments(args.softmax),
+            CollectiveSoftmaxEpilogue::to_underlying_arguments(args.problem_shape, args.softmax),
             CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
             TileScheduler::to_underlying_arguments(args.problem_shape, args.hw_info)};
   }
@@ -217,14 +208,13 @@ public:
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShapeQK>::value);
     CUTE_STATIC_ASSERT(is_static<TileShapePV>::value);
-    static_assert(cute::rank(StrideQ{}) == 3, "StrideQ must be rank-3: [seq_len_qo, head_size_qk, batch * num_heads_q].");
-    static_assert(cute::rank(StrideK{}) == 3, "StrideK must be rank-3: [head_size_qk, seq_len_kv, batch * num_heads_kv].");
+    // static_assert(cute::rank(StrideQ{}) == 3, "StrideQ must be rank-3: [seq_len_qo, head_size_qk, batch * num_heads_q].");
+    // static_assert(cute::rank(StrideK{}) == 3, "StrideK must be rank-3: [head_size_qk, seq_len_kv, batch * num_heads_kv].");
     // static_assert(cute::rank(StrideV{}) == 3, "StrideV must be rank-3: [seq_len_kv, head_size_vo, batch * num_heads_kv].");
 
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage *>(smem_buf);
     // Separate out problem shape for convenience
-    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size] = params.problem_shape;
-    int group_heads = ceil_div(num_heads_q, num_heads_kv); // 8
+    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = params.problem_shape;
 
     // context
     auto sg = syclcompat::get_nd_item<1>().get_sub_group();
@@ -247,8 +237,8 @@ public:
 
       /* tiling for current block */
       Tensor mQ_mkl = cute::get_xe_tensor(make_shape(num_heads_q, head_size, seq_len_q));
-      Tensor mK_nkl = cute::get_xe_tensor(make_shape(seq_len_kv, head_size, 1));
-      Tensor mV_nkl = cute::get_xe_tensor(make_shape(head_size, seq_len_kv, 1));
+      Tensor mK_nkl = cute::get_xe_tensor(make_shape(QK_BLK_N, head_size, 1));
+      Tensor mV_nkl = cute::get_xe_tensor(make_shape(head_size, QK_BLK_N, 1));
 
       Tensor mQ_mk = mQ_mkl(_, _, seq_coord);
       Tensor mK_nk = mK_nkl(_, _, 0);
@@ -259,6 +249,7 @@ public:
       auto gV = local_tile(mV_nk, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{}); // <16, 64, 8, 8>
 
       auto mainloop_params = params.mainloop;
+      auto softmax_params = params.softmax;
 
       /* prefetch config */
       // auto gK_prefetch = local_tile(mK_nk, SubgroupTileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});
@@ -287,6 +278,8 @@ public:
       // }
 
       CollectiveMainloop collective_mma;
+      CollectiveSoftmaxEpilogue softmax;
+      CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
 
       auto smem = syclcompat::local_mem<ElementAccumulator[((Int<size(tScoreShape{})>{}) * Num_SGs * SubgroupSize)]>();
       auto s_shape = make_shape(QK_BLK_M, QK_BLK_N);
@@ -302,70 +295,67 @@ public:
       ElementAccumulator max_reg = ElementAccumulator{-INFINITY};
       auto sum_reg = ElementAccumulator{0};
 
+      int kv_id = kv_start_id + context_coord * num_blocks_per_wg;
+      int block_id_k = current_block_table[kv_id];
+
+      mainloop_params = CollectiveMainloop::get_updated_copies_K(params.mainloop, params.problem_shape, heads_kv_coord, block_id_k);
+
+      auto softmax_coord = make_coord(seq_coord, heads_kv_coord, context_coord);
+      softmax_params =  CollectiveSoftmaxEpilogue::get_updated_copies(params.softmax, params.problem_shape, softmax_coord);
+      auto store_max = make_tensor(make_gmem_ptr(softmax_params.ptr_max + softmax_params.offset), 
+                                    make_layout(make_shape(num_heads_q, max_kv_tiles, seq_len_q),
+                                    softmax_params.dS));
+      auto store_sum = make_tensor(make_gmem_ptr(softmax_params.ptr_sum + softmax_params.offset), 
+                                    make_layout(make_shape(num_heads_q, max_kv_tiles, seq_len_q),
+                                    softmax_params.dS));
+
+      /* thread acc register*/
+      Tensor tSr = make_tensor<ElementAccumulator>(tScoreShape{});
+      clear(tSr);
+
+      // Perform GEMM S = Q*K
+      collective_mma.mmaQK(tSr, gQ, gK(_, _, kv_id / ATOM_M, _), tSr, ceil_div(head_size, QK_BLK_K), mainloop_params);
+
+      // Debug: Store S out
+      // auto blk_coord_debug = make_coord(0, split, _, seq_coord * num_heads_kv + heads_kv_coord); // <group_heads, kv_lens, q_lens * heads_kv>
+      // epilogue.debug_store_S(params.problem_shape, blk_coord_debug, tSr);
+
+      // softmax
+      softmax.template operator()<Num_SGs>(softmax_params, tSr, max_reg, sum_reg, t_store_score, t_load_score, store_max, store_sum);
+      
+
+      // Perform GEMM O = P*V
+      Tensor tPr = make_tensor<ElementAccumulator>(tProbShape{});
+      Tensor tOr = make_tensor<ElementAccumulator>(tOutShape{});
+      clear(tOr);
+
       CUTLASS_PRAGMA_UNROLL
-      for(int split = 0; split < kv_splits; split++) {
-        int kv_id = kv_start_id + split * num_blocks_per_wg;
-        int block_id_k = current_block_table[kv_id];
-
-        mainloop_params = CollectiveMainloop::get_updated_copies_K(params.mainloop, params.problem_shape, heads_kv_coord, block_id_k);
-        
-        /* thread acc register*/
-        Tensor tSr = make_tensor<ElementAccumulator>(tScoreShape{});
-        clear(tSr);
-
-        // Perform GEMM S = Q*K
-        collective_mma.mmaQK(tSr, gQ, gK(_, _, kv_id / ATOM_M, _), tSr, ceil_div(head_size, QK_BLK_K), mainloop_params);
-
-        // softmax
-        CollectiveSoftmaxEpilogue softmax(params.softmax);
-        softmax.template operator()<Num_SGs>(tSr, max_reg, sum_reg, t_store_score, t_load_score);
-
-        // Debug: Store S out
-        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        auto blk_coord_debug = make_coord(0, split, _, seq_coord * num_heads_kv + heads_kv_coord); // <group_heads, kv_lens, q_lens * heads_kv>
-        epilogue.debug_store_S(params.problem_shape, blk_coord_debug, tSr);
-
-        // if(cute::thread(15, 0)) {
-        //   print("sg_id: "); print(sg_id); print("\n");
-        //   print("kv_id: "); print(kv_id); print("\n");
-        //   print_tensor(tSr);
-        // }
-
-        // Perform GEMM O = P*V
-        Tensor tPr = make_tensor<ElementAccumulator>(tProbShape{});
-        Tensor tOr = make_tensor<ElementAccumulator>(tOutShape{});
-        clear(tOr);
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int v = 0; v < v_tile_count; v++) {
-          int block_id_v = current_block_table[v];
-          Tensor gPs = local_tile(score_blk, select<0, 2>(TileShapePV{}), make_coord(0, _)); // 8x64
-          mainloop_params = CollectiveMainloop::get_updated_copies_V(params.mainloop, params.problem_shape, heads_kv_coord, block_id_v);
-          collective_mma.mmaPV(tOr, gPs(_, _, v), tPr, gV(_, _, sg_id, 0), tOr, mainloop_params, v);
-        }
-
-        if (cute::thread(0, 0)) {
-          print_tensor(tOr);
-          print_tensor(load_score_warp);
-        }
-
-        // Store out
-        // CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        auto blk_coord_O = make_coord(heads_kv_coord, 0, seq_coord); // <num_heads_q, head_size, q_lens>
-        epilogue.store_O(params.problem_shape, blk_coord_O, tOr);
-
-        // if(cute::thread(0, 0)) {
-        //   print("tScoreShape: "); print(Int<size(tScoreShape{})>{}); print("\n");
-        //   print_tensor(store_score_warp);
-        //   print_tensor(t_store_score);
-        //   print_tensor(tSr);
-        //   print_tensor(t_load_score);
-        //   print("load_score_warp: "); print(load_score_warp); print("\n");
-        //   print_tensor(load_score_warp);
-        // }
-
-        // prefetch next kv tile
+      for (int v = 0; v < v_tile_count; v++) {
+        int block_id_v = current_block_table[v];
+        Tensor gPs = local_tile(score_blk, select<0, 2>(TileShapePV{}), make_coord(0, _)); // 8x64
+        mainloop_params = CollectiveMainloop::get_updated_copies_V(params.mainloop, params.problem_shape, heads_kv_coord, block_id_v);
+        collective_mma.mmaPV(tOr, gPs(_, _, v), tPr, gV(_, _, sg_id, 0), tOr, mainloop_params, v);
       }
+
+      // if (cute::thread(0, 0)) {
+      //   print_tensor(tOr);
+      //   print_tensor(load_score_warp);
+      // }
+
+      // Store out
+      // CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      auto blk_coord_O = make_coord(heads_kv_coord, context_coord, seq_coord); // <num_heads_q, head_size, q_lens>
+      epilogue.store_O(params.problem_shape, blk_coord_O, tOr);
+
+      // if(cute::thread(0, 0)) {
+      //   print("tScoreShape: "); print(Int<size(tScoreShape{})>{}); print("\n");
+      //   print_tensor(store_score_warp);
+      //   print_tensor(t_store_score);
+      //   print_tensor(tSr);
+      //   print_tensor(t_load_score);
+      //   print("load_score_warp: "); print(load_score_warp); print("\n");
+      //   print_tensor(load_score_warp);
+      // }
     }
   }
 };

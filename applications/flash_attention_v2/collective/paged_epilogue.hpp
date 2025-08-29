@@ -129,11 +129,10 @@ public:
   template <class ProblemShape>
   static constexpr Params to_underlying_arguments(ProblemShape const &problem_shape, Arguments const &args,
                                                   [[maybe_unused]] void *workspace) {
-    auto [num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size] = problem_shape;
-    auto group_heads = ceil_div(num_heads_q, num_heads_kv);
+    auto [num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = problem_shape;
 
     auto tensorO = make_tensor(make_gmem_ptr(static_cast<ElementO const*>(args.ptr_O)), 
-                                             make_layout(make_shape(num_heads_q, head_size, seq_len_qo),
+                                             make_layout(make_shape(num_heads_q, max_kv_tiles * head_size, seq_len_qo),
                                              args.dO));
     auto tensorS = make_tensor(make_gmem_ptr(static_cast<ElementO const*>(args.ptr_S)), 
                                              make_layout(make_shape(group_heads, seq_len_kv, seq_len_qo * num_heads_kv),
@@ -178,9 +177,9 @@ public:
 
     // tile the output ptr
     auto [m_coord, n_coord, l_coord] = tile_coord;
-    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size] = problem_shape;
+    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = problem_shape;
     // tile for wg
-    Tensor mO_mnl = cute::get_xe_tensor(make_shape(num_heads_q, head_size, seq_len_q));
+    Tensor mO_mnl = cute::get_xe_tensor(make_shape(num_heads_q, max_kv_tiles * head_size, seq_len_q));
     Tensor mO_mn = mO_mnl(_, _, l_coord);
     Tensor g_wg_O = local_tile(mO_mn, select<0, 1>(TileShapeOutput{}), make_coord(m_coord, n_coord));
     // tile for sg
@@ -221,8 +220,7 @@ public:
 
     // tile the output ptr
     auto [m_coord, n_coord, k_coord, l_coord] = tile_coord;
-    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size] = problem_shape;
-    auto group_heads = ceil_div(num_heads_q, num_heads_kv); // 8
+    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = problem_shape;
     // tile for wg
     Tensor mS_mnl = cute::get_xe_tensor(make_shape(group_heads, seq_len_kv, seq_len_q * num_heads_kv));
     Tensor mS_mn = mS_mnl(_, _, l_coord);

@@ -213,7 +213,7 @@ struct PagedMma<gemm::MainloopIntelXeXMX16<Stages>, ProblemShapeType_,
                                                   void *workspace) {
     (void)workspace;
 
-    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_blocks, block_size, head_size] = problem_shape;
+    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = problem_shape;
 
     auto tensorQ = make_tensor(make_gmem_ptr(args.ptr_Q), make_layout(make_shape(num_heads_q, head_size, seq_len_q), args.strideQ));
     auto tensorK = make_tensor(make_gmem_ptr(args.ptr_K), make_layout(make_shape(seq_len_kv, num_heads_kv * head_size, 1), args.strideK));
@@ -335,22 +335,22 @@ struct PagedMma<gemm::MainloopIntelXeXMX16<Stages>, ProblemShapeType_,
     copy(params.gmem_tiled_copy_v, tVgV, tVrV);
     cute::gemm(tiled_mma, accum, tPr_dtype, tCrV, frag_src);
 
-    if (cute::thread(0, 0)) {
-      // print("gV: "); print(gV); print("\n");
-      print("tCgV: "); print(tCgV); print("\n");
-      // print("params.gmem_tiled_copy_v: "); print(params.gmem_tiled_copy_v); print("\n");
-      // print("gPs: "); print(gPs); print("\n");
-      // print("tPs: "); print(tPs); print("\n");
-      print_tensor(tCrV);
-      for (int i = 0; i < Int<size(FragP{})>{}; ++i) {
-        print("FragP: "); print(tPr(i)); print("\n");
-      }
-    }
+    // if (cute::thread(0, 0)) {
+    //   // print("gV: "); print(gV); print("\n");
+    //   print("tCgV: "); print(tCgV); print("\n");
+    //   // print("params.gmem_tiled_copy_v: "); print(params.gmem_tiled_copy_v); print("\n");
+    //   // print("gPs: "); print(gPs); print("\n");
+    //   // print("tPs: "); print(tPs); print("\n");
+    //   print_tensor(tCrV);
+    //   for (int i = 0; i < Int<size(FragP{})>{}; ++i) {
+    //     print("FragP: "); print(tPr(i)); print("\n");
+    //   }
+    // }
   }
 
   template <class ProblemShape>
   CUTLASS_DEVICE static constexpr Params get_updated_copies_K(Params const& params, ProblemShape const& problem_shape, int const& head_id, const int& block_id) {
-    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_blocks, block_size, head_size] = problem_shape;
+    auto [num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = problem_shape;
 
     // key: [block_num, block_size, num_heads, head_size]
     // stride head_num: head_size
@@ -373,7 +373,7 @@ struct PagedMma<gemm::MainloopIntelXeXMX16<Stages>, ProblemShapeType_,
 
   template <class ProblemShape>
   CUTLASS_DEVICE static constexpr Params get_updated_copies_V(Params const& params, ProblemShape const& problem_shape, int const& head_id, int const& block_id) {
-    auto [num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, num_blocks, block_size, head_size] = problem_shape;
+    auto [num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, num_block, block_size, head_size, max_kv_tiles, group_heads] = problem_shape;
 
     // value: [block_num, block_size, num_heads, head_size]
     // stride head_num: head_size
