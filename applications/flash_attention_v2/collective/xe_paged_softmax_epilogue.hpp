@@ -118,13 +118,13 @@ public:
   template <int Num_SGs, class FragAcc, class STensorStore, class STensorLoad, class TensorM, class TensorS>
   CUTLASS_DEVICE void operator()(Params const &params, FragAcc &frag_s, Element& max_reg, Element& sum_reg, STensorStore& smem_store,
                                   STensorLoad& smem_load, TensorM &tensor_max, TensorS &tensor_sum) {
+    Element sum_reg_store;
     //context
     auto sg = syclcompat::get_nd_item<1>().get_sub_group();
     auto wg = syclcompat::get_nd_item<1>().get_group();
     const int sg_local_id = sg.get_local_id()[0];
 
-    auto thr_store_max = params.xe_store.get_slice(0);
-    auto thr_store_sum = params.xe_store.get_slice(0);
+    auto thr_store_softmax = params.xe_store.get_slice(0);
 
     // store S into shared_mem
     CUTLASS_PRAGMA_UNROLL
@@ -139,22 +139,6 @@ public:
       max_reg = sycl::max(max_reg, smem_load(i));
     }
     max_reg = reduce_over_group(sg, max_reg, sycl::maximum<>());
-    // TODO: save max_reg
-    if (sg_local_id == 0) {
-      Tensor gD = tensor_max;
-      Tensor tD = thr_store_max.partition_D(gD);
-      // if (cute::thread(0, 0)) {
-      //   print("params.xe_store: "); print(params.xe_store); print("\n");
-      //   print("thr_store_max: "); print(thr_store_max); print("\n");
-      //   print("gD: "); print(gD); print("\n");
-      //   print("tD:"); print(tD); print("\n");
-      //   print("max_reg: "); print(max_reg); print("\n");
-      // }
-      Tensor t_max_reg = make_tensor(&max_reg, Shape<_1, _1, _1>{});
-      Tensor t_max_reg_store = thr_store_max.partition_S(t_max_reg);
-
-      copy(params.xe_store, t_max_reg_store, tD);
-    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < Int<size(FragAcc{})>{}; ++i) {
@@ -163,15 +147,7 @@ public:
       sum_reg += smem_load(i);
     }
     sum_reg = reduce_over_group(sg, sum_reg, sycl::plus<>());
-    // TODO: save sum_reg
-    if (sg_local_id == 0) {
-      Tensor gD = tensor_sum;
-      Tensor tD = thr_store_sum.partition_D(gD);
-      Tensor t_sum_reg = make_tensor(&sum_reg, Shape<_1, _1, _1>{});
-      Tensor t_sum_reg_store = thr_store_sum.partition_S(t_sum_reg);
-
-      copy(params.xe_store, t_sum_reg_store, tD);
-    }
+    sum_reg_store = sum_reg;
     sum_reg = sum_reg == 0.0f ? 1.0f : sycl::native::recip(sum_reg);
 
     CUTLASS_PRAGMA_UNROLL
@@ -179,6 +155,22 @@ public:
       smem_load(i) = smem_load(i) * sum_reg;
     }
     sycl::group_barrier(wg);
+
+    if (sg_local_id == 0) {
+      Tensor gD_sum = tensor_sum;
+      Tensor tD_sum = thr_store_softmax.partition_D(gD_sum);
+      Tensor t_sum_reg = make_tensor(&sum_reg_store, Shape<_1, _1, _1>{});
+      Tensor t_sum_reg_store = thr_store_softmax.partition_S(t_sum_reg);
+
+      Tensor gD_max = tensor_max;
+      Tensor tD_max = thr_store_softmax.partition_D(gD_max);
+      Tensor t_max_reg = make_tensor(&max_reg, Shape<_1, _1, _1>{});
+      Tensor t_max_reg_store = thr_store_softmax.partition_S(t_max_reg);
+
+      copy(params.xe_store, t_sum_reg_store, tD_sum);
+      copy(params.xe_store, t_max_reg_store, tD_max);
+    }
+    
 
     // debug: store back
     // CUTLASS_PRAGMA_UNROLL

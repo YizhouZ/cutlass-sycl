@@ -300,14 +300,14 @@ public:
 
       mainloop_params = CollectiveMainloop::get_updated_copies_K(params.mainloop, params.problem_shape, heads_kv_coord, block_id_k);
 
-      auto softmax_coord = make_coord(seq_coord, heads_kv_coord, context_coord);
-      softmax_params =  CollectiveSoftmaxEpilogue::get_updated_copies(params.softmax, params.problem_shape, softmax_coord);
-      auto store_max = make_tensor(make_gmem_ptr(softmax_params.ptr_max + softmax_params.offset), 
-                                    make_layout(make_shape(num_heads_q, max_kv_tiles, seq_len_q),
-                                    softmax_params.dS));
-      auto store_sum = make_tensor(make_gmem_ptr(softmax_params.ptr_sum + softmax_params.offset), 
-                                    make_layout(make_shape(num_heads_q, max_kv_tiles, seq_len_q),
-                                    softmax_params.dS));
+      // auto softmax_coord = make_coord(seq_coord, heads_kv_coord, context_coord);
+      // softmax_params =  CollectiveSoftmaxEpilogue::get_updated_copies(params.softmax, params.problem_shape, softmax_coord);
+      // auto store_max = make_tensor(make_gmem_ptr(softmax_params.ptr_max + softmax_params.offset), 
+      //                               make_layout(make_shape(num_heads_q, max_kv_tiles, seq_len_q),
+      //                               softmax_params.dS));
+      // auto store_sum = make_tensor(make_gmem_ptr(softmax_params.ptr_sum + softmax_params.offset), 
+      //                               make_layout(make_shape(num_heads_q, max_kv_tiles, seq_len_q),
+      //                               softmax_params.dS));
 
       /* thread acc register*/
       Tensor tSr = make_tensor<ElementAccumulator>(tScoreShape{});
@@ -321,7 +321,7 @@ public:
       // epilogue.debug_store_S(params.problem_shape, blk_coord_debug, tSr);
 
       // softmax
-      softmax.template operator()<Num_SGs>(softmax_params, tSr, max_reg, sum_reg, t_store_score, t_load_score, store_max, store_sum);
+      // softmax.template operator()<Num_SGs>(softmax_params, tSr, max_reg, sum_reg, t_store_score, t_load_score, store_max, store_sum);
       
 
       // Perform GEMM O = P*V
@@ -329,13 +329,13 @@ public:
       Tensor tOr = make_tensor<ElementAccumulator>(tOutShape{});
       clear(tOr);
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int v = 0; v < v_tile_count; v++) {
-        int block_id_v = current_block_table[v];
-        Tensor gPs = local_tile(score_blk, select<0, 2>(TileShapePV{}), make_coord(0, _)); // 8x64
-        mainloop_params = CollectiveMainloop::get_updated_copies_V(params.mainloop, params.problem_shape, heads_kv_coord, block_id_v);
-        collective_mma.mmaPV(tOr, gPs(_, _, v), tPr, gV(_, _, sg_id, 0), tOr, mainloop_params, v);
-      }
+      // Tensor gPs = local_tile(score_blk, select<0, 2>(TileShapePV{}), make_coord(0, _)); // 8x64
+      // CUTLASS_PRAGMA_UNROLL
+      // for (int v = 0; v < v_tile_count; v++) {
+      //   int block_id_v = current_block_table[v];
+      //   mainloop_params = CollectiveMainloop::get_updated_copies_V(params.mainloop, params.problem_shape, heads_kv_coord, block_id_v);
+      //   collective_mma.mmaPV(tOr, gPs(_, _, v), tPr, gV(_, _, sg_id, 0), tOr, mainloop_params, v);
+      // }
 
       // if (cute::thread(0, 0)) {
       //   print_tensor(tOr);
@@ -344,8 +344,8 @@ public:
 
       // Store out
       // CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-      auto blk_coord_O = make_coord(heads_kv_coord, context_coord, seq_coord); // <num_heads_q, head_size, q_lens>
-      epilogue.store_O(params.problem_shape, blk_coord_O, tOr);
+      // auto blk_coord_O = make_coord(heads_kv_coord, context_coord, seq_coord); // <num_heads_q, head_size, q_lens>
+      // epilogue.store_O(params.problem_shape, blk_coord_O, tOr);
 
       // if(cute::thread(0, 0)) {
       //   print("tScoreShape: "); print(Int<size(tScoreShape{})>{}); print("\n");

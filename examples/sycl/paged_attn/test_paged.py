@@ -161,44 +161,53 @@ v_cache_ref = rearrange(
 )[:, :seqlen_kv]
 
 sm_scale = 1. / math.sqrt(head_size)
+iter_warm = 5
+iter_perf = 100
 
 # warm up
-for i in range(10):
-    paged_attention.run(
-        max_logits,
-        exp_sums,
-        temp_out,
-        out,
-        scores,
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        sm_scale,
-        block_size,
-        seqlen_kv
-    )
+print("into warm up")
+paged_attention.run(
+    max_logits,
+    exp_sums,
+    temp_out,
+    out,
+    scores,
+    query,
+    key_cache,
+    value_cache,
+    block_tables,
+    sm_scale,
+    block_size,
+    seqlen_kv,
+    5,
+)
+print("end warmup")
 
+exec_time = 0.
 start_counter = perf_counter_ns()
-for i in range(1000):
-    paged_attention.run(
-        max_logits,
-        exp_sums,
-        temp_out,
-        out,
-        scores,
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        sm_scale,
-        block_size,
-        seqlen_kv
-    )
+iter_time = paged_attention.run(
+    max_logits,
+    exp_sums,
+    temp_out,
+    out,
+    scores,
+    query,
+    key_cache,
+    value_cache,
+    block_tables,
+    sm_scale,
+    block_size,
+    seqlen_kv,
+    iter_perf
+)
+exec_time += iter_time[0]
 end_counter = perf_counter_ns()
 
-exec_time = (end_counter - start_counter) / 1000 * 1e-3;
+# exec_time = (end_counter - start_counter) / 100 * 1e-3;
+exec_time = exec_time / iter_perf
 total_kv_size = key_cache.numel() * key_cache.element_size() * 2
+gemm_qk = seqlen_q * num_heads_q * seqlen_kv * head_size * 2.0
+gemm_all = gemm_qk * 2
 print(
     f"Time: {exec_time:.2f} us, "
     f"Total KV size: {total_kv_size / (1024 * 1024):.2f} MB, "
