@@ -77,8 +77,8 @@ struct XeFlashIndividualTileScheduler {
     int head_size_vo = size<7>(problem_size);
     auto group_heads_q = num_heads_q / num_heads_kv;
 
-    dim3 grid(size(ceil_div(shape<3>(problem_size) * group_heads_q, shape<0>(tile_shape))),
-              size(shape<1>(problem_size) / group_heads_q), size(shape<0>(problem_size)));
+    dim3 grid(size(ceil_div(shape<3>(problem_size), shape<0>(tile_shape))),
+              size(shape<1>(problem_size)), size(shape<0>(problem_size)));
     return Params{grid};
   }
 

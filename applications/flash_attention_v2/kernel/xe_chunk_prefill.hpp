@@ -248,7 +248,6 @@ public:
     auto num_heads_q = get<1>(params.problem_shape);
     auto num_heads_kv = get<2>(params.problem_shape);
     auto q_group_size = num_heads_q / num_heads_kv;
-    auto q_group_nums = num_heads_q / q_group_size;
 
     // auto &seq_len_qo = get<3>(params.problem_shape); // seq_len_qo
 
@@ -278,7 +277,7 @@ public:
 
       auto blk_m_coord = get<0>(blk_coord); // seq_len_blk_idx
       auto blk_n_coord = 0;                   // nums_head_blk_idx
-      auto q_group_coord = get<1>(blk_coord); // kv_heads_idx
+      auto q_head_coord = get<1>(blk_coord); // q_head_idx
 
       auto batch_coord = get<2>(blk_coord); // batch_blk_idx
 
@@ -289,7 +288,7 @@ public:
       // batch_size. iff is_var_len: batch_size = num_heads (as each batch
       // would have it's own seq_len_qo and seq_len_kv) iff !is_var_len:
       // batch_size = batch * num_heads
-      auto blk_l_coord = q_group_coord;
+      // auto blk_l_coord = q_group_coord;
 
       // Get problem shape for the current batch_blk_idx. For variable
       // sequence length, it loads the sequence length from Global memory for
@@ -300,6 +299,7 @@ public:
       // head_size_qk, head_size_vo]
       auto sequence_length_shape =
           get_sequence_length_shape(params.problem_shape, batch_coord);
+      get<1>(sequence_length_shape) = 0;
 
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
       // int seq_len_kv_total = seq_len_kv_cache + seq_len_kv;
@@ -314,8 +314,7 @@ public:
       // Calculate the seq_len_idx (blk_m_coord * get<0>(TileShapeOutput{}))
       // and check if it is still within bounds of the actual seq_len_qo
       // (get<0>(sequence_length_shape)).
-      if (blk_m_coord * get<0>(TileShapeOutput{}) >=
-          seq_len_qo * q_group_size) {
+      if (blk_m_coord * get<0>(TileShapeOutput{}) >= seq_len_qo) {
         continue;
       }
 
@@ -363,10 +362,6 @@ public:
       Tensor mK_cache_nk = mK_cache_nkl(_, _, 0); // (n_cache, k)
       Tensor mV_cache_nk = mV_cache_nkl(_, _, 0); // (n_cache, k)
 
-      using GQATileShapeQK = Shape<Int<get<0>(TileShapeQK{}) / 2>, // M1
-                                   Int<get<1>(TileShapeQK{})>,
-                                   Int<get<2>(TileShapeQK{}) * 2>>; // K1
-
       auto gQ = local_tile(mQ_mk, TileShapeQK{}, make_coord(blk_m_coord, _, _),
                            Step<_1, X, _1>{});
       auto gK = local_tile(mK_nk, TileShapeQK{}, make_coord(_, _, _),
@@ -382,7 +377,7 @@ public:
 
       auto mainloop_params = CollectiveMainloop::get_updated_copies(
           params.mainloop, params.problem_shape, sequence_length_shape,
-          batch_coord, q_group_coord);
+          batch_coord, q_head_coord);
 
 
       // we limit the horisontal size to two subgroup, the empirical resutls
@@ -428,14 +423,15 @@ public:
       int cached_nblock = 0;
       if constexpr (PagedKV) {
         if (seq_len_kv_cache != 0) {
-          int curr_batch_pages =
-              is_var_len
-                  ? mainloop_params.num_pages_per_seq[batch_coord + 1] -
-                        mainloop_params.num_pages_per_seq[batch_coord]
-                  : ceil_div(seq_len_kv_cache, mainloop_params.page_size);
-          int batch_offset =
-              is_var_len ? mainloop_params.num_pages_per_seq[batch_coord]
-                         : batch_coord * curr_batch_pages;
+          // int curr_batch_pages =
+          //     is_var_len
+          //         ? mainloop_params.num_pages_per_seq[batch_coord + 1] -
+          //               mainloop_params.num_pages_per_seq[batch_coord]
+          //         : ceil_div(seq_len_kv_cache, mainloop_params.page_size);
+          // int batch_offset =
+          //     is_var_len ? mainloop_params.num_pages_per_seq[batch_coord]
+          //                : batch_coord * curr_batch_pages;
+          int batch_offset = batch_coord * mainloop_params.max_pages_per_seq;
           cached_nblock =
               mainloop_params
                   .ptr_page_table[batch_offset // page table for this batch
@@ -505,6 +501,29 @@ public:
                              ceil_div(head_size_qk, QK_BLK_K), mainloop_params,
                              is_KV_cache);
 
+        // mask padding
+        {
+          const int item_id = thread_idx % SubgroupSize;
+          int col_start = item_id + split * cute::min(QK_BLK_N, seq_len_kv_cache);
+          int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
+          if (col_end >= seq_len_kv_cache) {
+            int col_idx = col_start;
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) { // 4
+              if (col_idx < seq_len_kv_cache) {
+                continue;
+              }
+              CUTLASS_PRAGMA_UNROLL
+              for (int m = 0; m < FragsM; m++) { // 2
+                CUTLASS_PRAGMA_UNROLL
+                for (int row = 0; row < Vec; row++) { // 8
+                  tSr(row, m, n) = ElementAccumulator{-INFINITY};
+                }
+              }
+            }
+          }
+        }
+
         if constexpr (LocalMask) {
           // mask the elements of each tile where j - left > i || j + right < i
           const int item_id = thread_idx % SubgroupSize;
@@ -545,16 +564,18 @@ public:
         bool is_next_KV_cache = next_cached_nblock < kv_splits_cache;
         if constexpr (PagedKV) {
           if (is_next_KV_cache) {
-            int curr_batch_pages =
-                is_var_len
-                    ? mainloop_params.num_pages_per_seq[batch_coord + 1] -
-                          mainloop_params.num_pages_per_seq[batch_coord]
-                    : ceil_div(seq_len_kv_cache, mainloop_params.page_size);
+            // int curr_batch_pages =
+            //     is_var_len
+            //         ? mainloop_params.num_pages_per_seq[batch_coord + 1] -
+            //               mainloop_params.num_pages_per_seq[batch_coord]
+            //         : ceil_div(seq_len_kv_cache, mainloop_params.page_size);
+            int curr_batch_pages = mainloop_params.max_pages_per_seq;
             int next_page_logical_idx =
                 next_cached_nblock * QK_BLK_N / params.mainloop.page_size;
-            int batch_offset =
-                is_var_len ? mainloop_params.num_pages_per_seq[batch_coord]
-                           : batch_coord * curr_batch_pages;
+            // int batch_offset =
+            //     is_var_len ? mainloop_params.num_pages_per_seq[batch_coord]
+            //                : batch_coord * curr_batch_pages;
+            int batch_offset = batch_coord * mainloop_params.max_pages_per_seq;
             bool valid_page = next_page_logical_idx < curr_batch_pages;
             // get physical page idx from page table
             if (valid_page) {
@@ -577,7 +598,13 @@ public:
         // 4) Fused softmax
         CollectiveSoftmaxEpilogue softmax(params.softmax);
         softmax(split == 0, tSr, max_reg, sum_reg, out_reg);
-   
+        // if (cute::thread(0, 0)) {
+        //   ElementAccumulator temp_reg{-INFINITY};
+        //   temp_reg = temp_reg - 0.1f;
+        //   print("test1: "); print(temp_reg); print("\n");
+        //   temp_reg = sycl::native::exp2(temp_reg);
+        //   print("test2: "); print(temp_reg); print("\n");
+        // }
         // 5) Perform GEMM O = S*V
         collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV_, out_reg,
                                                mainloop_params, is_KV_cache);
@@ -657,7 +684,7 @@ public:
       auto epilogue_params =
           CollectiveEpilogue::template get_updated_copies<is_var_len>(
               params.epilogue, params.problem_shape, sequence_length_shape,
-              batch_coord, q_group_coord);
+              batch_coord, q_head_coord);
       CollectiveEpilogue epilogue{epilogue_params, shared_storage.epilogue};
       auto blk_coord_mnkl = make_coord(blk_m_coord, blk_n_coord, _, 0);
       epilogue(params.problem_shape, sequence_length_shape, blk_coord_mnkl,

@@ -191,7 +191,8 @@ struct FlashChunkPrefillMma<
     // Paged KV Cache
     int const *ptr_page_table;
     int page_size;
-    int const *num_pages_per_seq;
+    int const max_pages_per_seq;
+    int const total_seqlen_k;
     int window_left;
     int window_right;
   };
@@ -205,7 +206,8 @@ struct FlashChunkPrefillMma<
     // Paged KV Cache
     int const *ptr_page_table;
     int page_size;
-    int const *num_pages_per_seq;
+    int const max_pages_per_seq;
+    int const total_seqlen_k;
     int window_left;
     int window_right;
   };
@@ -239,7 +241,7 @@ struct FlashChunkPrefillMma<
                     args.dK));
     auto tensorV = make_tensor(
         make_gmem_ptr(args.ptr_V),
-        make_layout(make_shape(head_size_vo, num_heads_kv * seq_len_kv, batch),
+        make_layout(make_shape(head_size_vo * num_heads_kv, seq_len_kv, batch),
                     args.dV));
     auto tensorK_cache =
         make_tensor(make_gmem_ptr(args.ptr_K_cache),
@@ -249,7 +251,7 @@ struct FlashChunkPrefillMma<
     auto tensorV_cache = make_tensor(
         make_gmem_ptr(args.ptr_V_cache),
         make_layout(
-            make_shape(head_size_vo, num_heads_kv * seq_len_kv_cache, batch),
+            make_shape(head_size_vo * num_heads_kv, seq_len_kv_cache, batch),
             args.dV_cache));
 
     XE_Copy_Q copyQ{XE_Copy_Q{}.with(tensorQ)};
@@ -261,7 +263,8 @@ struct FlashChunkPrefillMma<
     return Params{copyQ,            copyK,
                   copyV,            copyK_cache,
                   copyV_cache,      args.ptr_page_table,
-                  args.page_size,   args.num_pages_per_seq,
+                  args.page_size,   args.max_pages_per_seq,
+                  args.total_seqlen_k,
                   args.window_left, args.window_right};
   }
 
@@ -409,6 +412,10 @@ struct FlashChunkPrefillMma<
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tile_count; i++) {
       copy(gmem_tiled_copy_v, tVgV(_, _, _, i), tVrV);
+      // if (cute::thread(0, 0)) {
+      //   print("V:\n");
+      //   print_tensor(tVrV);
+      // }
       cute::gemm(tiled_mma, accum(_, _, _, i), tPr, tCrV, frag_src(_, _, _, i));
     }
   }
@@ -421,11 +428,15 @@ struct FlashChunkPrefillMma<
   CUTLASS_DEVICE static constexpr Params
   get_updated_copies(Params const &params, ProblemShape const &problem_shape,
                      SequenceLengthShape const &sequence_length_shape,
-                     int const &l_coord, int const &q_group_coord = 0) {
+                     int const &l_coord, int const &q_head_coord = 0) {
     auto [num_heads_q, num_heads_kv, head_size_qk, head_size_vo] =
         select<1, 2, 6, 7>(problem_shape);
     auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
+    if constexpr (PagedKV) {
+      seq_len_kv_cache = params.total_seqlen_k;
+    }
     auto q_group_size = num_heads_q / num_heads_kv;
+    auto kv_head_coord = q_head_coord / q_group_size;
     int offset_q = 0, offset_k = 0, offset_v = 0, offset_k_cache = 0,
         offset_v_cache = 0;
     if constexpr (is_var_len) {
@@ -434,24 +445,23 @@ struct FlashChunkPrefillMma<
       auto kv_cached_cumulative_length =
           get<5>(problem_shape).cumulative_length;
 
-      offset_q = num_heads_q /*q_group_nums * q_group_size*/ * head_size_qk *
-                     qo_cumulative_length[l_coord] +
-                 q_group_coord * q_group_size * head_size_qk;
+      offset_q = num_heads_q * head_size_qk * qo_cumulative_length[l_coord] +
+                 q_head_coord * head_size_qk;
 
       offset_k = num_heads_kv * head_size_qk * kv_cumulative_length[l_coord] +
-                 q_group_coord * head_size_qk;
+                 kv_head_coord * head_size_qk;
       offset_v = num_heads_kv * head_size_vo * kv_cumulative_length[l_coord] +
-                 q_group_coord * head_size_vo;
+                 kv_head_coord * head_size_vo;
       offset_k_cache = seq_len_kv_cache == 0
                            ? 0
-                           : PagedKV ? q_group_coord * head_size_qk :
+                           : PagedKV ? kv_head_coord * head_size_qk :
                                 num_heads_kv * head_size_qk * kv_cached_cumulative_length[l_coord] +
-                                q_group_coord * head_size_qk;
+                                kv_head_coord * head_size_qk;
       offset_v_cache = seq_len_kv_cache == 0
                            ? 0
-                           : PagedKV ? q_group_coord * head_size_vo :
+                           : PagedKV ? kv_head_coord * head_size_vo :
                                 num_heads_kv * head_size_vo * kv_cached_cumulative_length[l_coord] + 
-                                q_group_coord * head_size_vo;
+                                kv_head_coord * head_size_vo;
     } else {
       // int offset_q = num_heads_q/*q_group_nums * q_group_size*/ *
       // head_size_qk * qo_cumulative_length[l_coord];
@@ -464,21 +474,21 @@ struct FlashChunkPrefillMma<
 
       offset_q = num_heads_q /*q_group_nums * q_group_size*/ * head_size_qk *
                      seq_len_qo * l_coord +
-                 q_group_coord * q_group_size * head_size_qk;
+                q_head_coord * head_size_qk;
 
       offset_k = num_heads_kv * head_size_qk * seq_len_kv * l_coord +
-                 q_group_coord * head_size_qk;
+                 kv_head_coord * head_size_qk;
       offset_v = num_heads_kv * head_size_vo * seq_len_kv * l_coord +
-                 q_group_coord * head_size_vo;
+                 kv_head_coord * head_size_vo;
       offset_k_cache =
           seq_len_kv_cache == 0
               ? 0
-              : PagedKV ? q_group_coord * head_size_qk :
-              num_heads_kv * head_size_qk * seq_len_kv_cache * l_coord + q_group_coord * head_size_qk;
+              : PagedKV ? kv_head_coord * head_size_qk :
+              num_heads_kv * head_size_qk * seq_len_kv_cache * l_coord + kv_head_coord * head_size_qk;
       offset_v_cache =
           seq_len_kv_cache == 0
-              ? 0 : PagedKV ? q_group_coord * head_size_vo :
-              num_heads_kv * head_size_vo * seq_len_kv_cache * l_coord + q_group_coord * head_size_vo;
+              ? 0 : PagedKV ? kv_head_coord * head_size_vo :
+              num_heads_kv * head_size_vo * seq_len_kv_cache * l_coord + kv_head_coord * head_size_vo;
     }
 
     auto q_traits =
@@ -540,7 +550,8 @@ struct FlashChunkPrefillMma<
                   copyV_cache,
                   params.ptr_page_table,
                   params.page_size,
-                  params.num_pages_per_seq,
+                  params.max_pages_per_seq,
+                  params.total_seqlen_k,
                   params.window_left,
                   params.window_right};
   }
