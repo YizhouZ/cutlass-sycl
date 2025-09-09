@@ -265,7 +265,8 @@ public:
                   "num_heads_kv].");
 
     int thread_idx = int(ThreadIdxX());
-    int sub_group_id = thread_idx / SubgroupSize;
+    auto sub_group_id = get_sub_group_id();
+    auto local_id = get_sub_group_local_id();
 
     TileScheduler tile_scheduler{params.scheduler};
     CUTLASS_PRAGMA_NO_UNROLL
@@ -318,29 +319,13 @@ public:
         continue;
       }
 
-      const int seq_coord =
-          cute::min(seq_len_qo, (blk_m_coord * QK_BLK_M + (sub_group_id / PV_ATOM_N) * QK_SG_M) %
-          seq_len_qo);
-      auto offset = cute::min(seq_len_qo, seq_len_kv); //(2048, 1024)
-      auto discard_seq_coord = seq_len_qo - offset;    // 1024
-      auto full_tile_offset = seq_len_kv - offset;     // 0
-
-      const int seq_len =
-          CausalMask
-              ? full_tile_offset +
-                    cute::min(seq_len_kv, seq_coord - discard_seq_coord) +
-                    QK_SG_M
-              : seq_len_kv;
+      const int seq_len = seq_len_kv;
 
       const int kv_splits_new = cute::ceil_div(seq_len, QK_BLK_N);
       const int kv_splits_cache = cute::ceil_div(seq_len_kv_cache, QK_BLK_N);
       const int kv_splits = kv_splits_cache + kv_splits_new;
 
       int tiles_per_page = params.mainloop.page_size / QK_BLK_N;
-
-      if (CausalMask && seq_coord < discard_seq_coord) { // 1024 =0
-        continue;
-      }
 
       Tensor mQ_mkl = cute::get_xe_tensor(
           make_shape(seq_len_qo, head_size_qk, 1)); //(m,k,l)
@@ -467,21 +452,27 @@ public:
       // of the barrier to workgroup level as the number n block is
       // different for each subgroup due to triangular nature of causal based
       // operation
-      static constexpr int barrier_scope = CausalMask ? 3 : 2;
-      // int split_start = 0;
-      // int split_end = kv_splits;
-      // if constexpr (CausalMask) {
-      //   split_end = kv_splits - 1;
-      // } else if (LocalMask) {
-      //   split_start = cute::max(0, kv_splits_cache - ceil_div(mainloop_params.window_left, QK_BLK_N) - 1); // skip the first split as it is not needed
-      //   split_end = cute::min(kv_splits, kv_splits_cache + ceil_div(mainloop_params.window_right, QK_BLK_N) + 1); // skip the last split as it is not needed
-      // }
-      // if (thread0()) {
-      //   print("split_start %d split_end %d\n", split_start, split_end);
-      // }
+      // static constexpr int barrier_scope = CausalMask ? 3 : 2;
+      static constexpr int barrier_scope = 2;
+
+      int q_start_coord = blk_m_coord * QK_BLK_M;
+      int q_end_coord = cute::min(q_start_coord + QK_BLK_M, seq_len_qo);
+      int seq_diff = seq_len_kv_cache - seq_len_qo;
+
+      const int seq_coord =
+          cute::min(seq_len_qo, (blk_m_coord * QK_BLK_M + (sub_group_id / PV_ATOM_N) * QK_SG_M) %
+          seq_len_qo);
+
       CUTLASS_PRAGMA_UNROLL
-      for (int split = 0; split < kv_splits - static_cast<int>(CausalMask); split++) {
+      for (int split = 0; split < kv_splits; split++) {
         barrier_arrive(barrier_scope);
+
+        int kv_start_coord = split * QK_BLK_N;
+
+        if constexpr (CausalMask) {
+          if (kv_start_coord >= q_end_coord + seq_diff)
+            break;
+        }
 
         bool is_KV_cache = split < kv_splits_cache;
         // 1) Load KV (performed inside mmaQK)
@@ -502,22 +493,39 @@ public:
                              is_KV_cache);
 
         // mask padding
-        {
-          const int item_id = thread_idx % SubgroupSize;
-          int col_start = item_id + split * cute::min(QK_BLK_N, seq_len_kv_cache);
-          int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
-          if (col_end >= seq_len_kv_cache) {
-            int col_idx = col_start;
-            CUTLASS_PRAGMA_UNROLL
-            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) { // 4
-              if (col_idx < seq_len_kv_cache) {
-                continue;
-              }
+        int col_start = local_id + kv_start_coord;
+        int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
+        if (col_end >= seq_len_kv_cache) {
+          int col_idx = col_start;
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) { // 4
+            if (col_idx >= seq_len_kv_cache) {
               CUTLASS_PRAGMA_UNROLL
               for (int m = 0; m < FragsM; m++) { // 2
                 CUTLASS_PRAGMA_UNROLL
                 for (int row = 0; row < Vec; row++) { // 8
                   tSr(row, m, n) = ElementAccumulator{-INFINITY};
+                }
+              }
+            }
+          }
+        }
+
+        if constexpr (CausalMask) {
+          int row_start = q_start_coord + sub_group_id * QK_SG_M;
+          if (row_start + seq_diff < col_end) {
+            int col_idx = col_start;
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) { // 4
+              if (col_idx > row_start + seq_diff) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int m = 0; m < FragsM; m++) { // 2
+                  CUTLASS_PRAGMA_UNROLL
+                  for (int row = 0; row < Vec; row++) { // 8
+                    int row_idx = row_start + m * Vec + row;
+                    if (row_idx + seq_diff < col_idx)
+                      tSr(row, m, n) = ElementAccumulator{-INFINITY};
+                  }
                 }
               }
             }
@@ -636,49 +644,6 @@ public:
         }
         barrier_wait(barrier_scope);
       }
-
-      if constexpr (CausalMask) {
-        // BAND Matrix
-        // 1) Load K (performed inside mmaQK)
-        // 2) Create Tensor S
-        Tensor tSr = make_tensor<ElementAccumulator>(
-            Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
-        clear(tSr);
-        // 3) Perform GEMM S = Q*K
-        collective_mma.mmaQK(tSr, gQ, gK(_, _, kv_splits_new - 1, _), tSr,
-                             ceil_div(head_size_qk, QK_BLK_K), mainloop_params,
-                             false);
-        // we only need one block ahead, there is enough gap to prefetch it
-        // while doing softmax. because the gap between the two MMA is big,
-        // prefetching it the same way as cutlass K matrix does not make sense
-        for (int i = 0; i < size<1>(pVgV); i++) {
-          prefetch(tiled_prefetch_v, pVgV(_, i, _, kv_splits_new - 1));
-        }
-        // mask the elements of each tile where j > i
-        const int item_id = thread_idx % SubgroupSize;
-        int col_idx = item_id + (kv_splits_new - 1) * QK_BLK_N;
-        CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < FragsN;
-             n++, col_idx += get<1>(MmaAtomShape())) { // 4
-          CUTLASS_PRAGMA_UNROLL
-          for (int m = 0; m < FragsM; m++) { // 2
-            int row_idx = m * Vec + seq_coord;
-            CUTLASS_PRAGMA_UNROLL
-            for (int row = 0; row < Vec; row++, row_idx++) { // 8
-              if (col_idx - full_tile_offset > row_idx - discard_seq_coord) {
-                tSr(row, m, n) = ElementAccumulator{-INFINITY};
-              }
-            }
-          }
-        }
-
-        CollectiveSoftmaxEpilogue softmax(params.softmax);
-        softmax((kv_splits - 1) == 0, tSr, max_reg, sum_reg, out_reg);
-        collective_mma.template mmaPV<VSlicer>(out_reg, tSr,
-                                               gV(_, _, kv_splits_new - 1),
-                                               out_reg, mainloop_params, false);
-      }
-
 
       // Epilogue
       auto epilogue_params =
